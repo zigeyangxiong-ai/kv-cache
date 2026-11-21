@@ -58,7 +58,7 @@ python -m unittest discover -s tests -v
 **5. 跑故障注入实验**（会自己启动和关闭集群，用 18000 段端口，不影响第 1 步）
 
 ```
-python experiments/run_experiments.py          # 全部，大约 2 分钟
+python experiments/run_experiments.py          # 全部，大约 3 分钟
 python experiments/run_experiments.py E9 E10   # 只跑指定的
 ```
 
@@ -90,6 +90,7 @@ experiments/    故障注入实验和结果
 | `GET /stats` | 各节点的条目数、淘汰数、过期数 |
 | `GET /debug/metrics` | 回源次数、命中次数、合并的等待者数（实验用） |
 | `POST /debug/reset` | 计数清零（实验用） |
+| `POST /debug/origin` | `{"down": true}` 让模拟后端出错、`{"delay": 2.0}` 让它变慢（实验用） |
 
 原来的 `/get` 没有改动，所以之前的实验和测试都不受影响。
 
@@ -118,6 +119,15 @@ experiments/    故障注入实验和结果
 2. 没命中时，同一个 key 只让第一个请求去回源，其他请求等它的结果。
 3. 回源拿到数据后，用原来的 `/set` 流程写回两个副本（TTL 3 秒），再把结果交给所有等待者。
 4. 回源失败或超时，所有等待者都会收到同样的错误，不会一直挂着；不同 key 之间互不阻塞。
+
+**出错时的返回：**
+
+| 情况 | `/query` 的返回 |
+|---|---|
+| 这个 key 的两个缓存节点都连不上 | `NODES_UNAVAILABLE`，**不去回源**：节点一抖动就去查后端，等于把后端暴露给击穿 |
+| 后端出错 | `ORIGIN_UNAVAILABLE`，同一个 key 的等待者共享这个错误，后端只被尝试一次 |
+| 等别人回源超过 5 秒 | `ORIGIN_TIMEOUT` |
+| 后端取到了，但写回缓存失败 | 数据照样返回，`cache_filled: false`，下次还会回源 |
 
 模拟数据源写在入口进程里（`stampede.py` 的 `MockOrigin`），每次查询固定延迟 150 ms，只认 `demo:hot:1` 到 `demo:hot:10`
 这些预置 key。不把用户 `/set` 的数据当成后端数据，是为了避免缓存被淘汰后回源拿到和用户最后写入不一致的旧内容。
@@ -149,8 +159,9 @@ experiments/    故障注入实验和结果
 | E6 | TTL 到期 | 到期前能读，到期后读不到 |
 | E7 | LRU 淘汰 | 容量 3 时，最久没用的那条被删掉 |
 | E8 | 时钟倒退 60 秒 | 版本比较不受影响；过期数据"复活" |
-| E9 | 热点 key 过期后 100 个请求同时到达 | 关闭 Singleflight 每轮回源 82～100 次；开启后每轮只回源 1 次，两种情况 100 个请求都成功 |
+| E9 | 热点 key 过期后 100 个请求同时到达 | 关闭 Singleflight 每轮回源 80～91 次；开启后每轮只回源 1 次，两种情况 100 个请求都成功 |
 | E10 | 回填后 TTL 内再次访问 | 100 个请求全部命中缓存，不再回源；过期后再查才重新回源 |
+| E11 | 回源路径上的三种故障 | 后端挂了：50 个请求都收到 ORIGIN_UNAVAILABLE，后端只被尝试 1 次；缓存节点全挂：报错且不回源；回源途中缓存节点挂了：数据照样返回，`cache_filled=false` |
 
 E9 每种情况各跑 5 轮，每轮前都先让 key 过期。具体数字以 `experiments/results/experiment_log.md` 和 `E9_stampede.csv` 为准，每次运行会略有不同。
 

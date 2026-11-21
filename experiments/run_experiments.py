@@ -544,8 +544,105 @@ def _stampede_round_keep(c, key):
     return m["origin_load_count"], sum(oks), sorted(lat), time.perf_counter() - t0, m
 
 
+# ---------------------------------------------------------------- E11
+def _concurrent_query(c, key, n):
+    import threading
+    barrier = threading.Barrier(n)
+    out, lock = [], threading.Lock()
+
+    def worker():
+        barrier.wait()
+        try:
+            res = call("GET", c.gateway_url + "/query?key=" + quote(key, safe=""), timeout=15)
+        except OSError as e:
+            res = {"ok": False, "error": f"CLIENT_{e.__class__.__name__}"}
+        with lock:
+            out.append(res)
+
+    ts = [threading.Thread(target=worker) for _ in range(n)]
+    t0 = time.perf_counter()
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return out, time.perf_counter() - t0
+
+
+def e11():
+    r = Record("E11", "回源路径上的三种故障", "后端挂了、缓存节点全挂、写回缓存失败时，/query 都给出明确结果，不会卡住，也不会把故障说成“没找到”")
+    r.predict("(a) 后端挂掉时 50 个请求同时 /query 同一个 key：全部收到 ORIGIN_UNAVAILABLE，后端只被尝试 1 次，几百毫秒内全部返回；"
+              "后端恢复后下一次查询正常。(b) key 的两个缓存节点都挂掉：/query 返回 NODES_UNAVAILABLE，不去回源。"
+              "(c) 回源途中两个缓存节点挂掉：仍然把数据返回给客户端，但 cache_filled=false，refill_failed_count 加 1。")
+    with new_cluster(singleflight=True, origin_delay=ORIGIN_DELAY) as c:
+        gw = c.gateway_url
+        # (a)
+        ka = "demo:hot:3"
+        call("POST", gw + "/debug/reset", {})
+        r.step("让模拟后端挂掉", call("POST", gw + "/debug/origin", {"down": True}))
+        out, elapsed = _concurrent_query(c, ka, 50)
+        m = call("GET", gw + "/debug/metrics")
+        errs = sorted({x.get("error") for x in out})
+        r.step(f"(a) 50 个请求同时 /query {ka}：错误类型 {errs}，耗时 {elapsed * 1000:.0f} ms，后端被尝试 {m['origin_load_count']} 次，"
+               f"等待者 {m['coalesced_waiter_count']}")
+        r.step("让模拟后端恢复", call("POST", gw + "/debug/origin", {"down": False}))
+        after = call("GET", gw + "/query?key=" + quote(ka, safe=""), timeout=5)
+        r.step(f"(a) 恢复后再查 {ka}", after)
+        a_ok = (errs == ["ORIGIN_UNAVAILABLE"] and len(out) == 50 and m["origin_load_count"] == 1
+                and elapsed < 2.0 and after.get("found") and after.get("source") == "origin")
+        r.see(f"(a) 50 个请求全部是 ORIGIN_UNAVAILABLE；后端只被尝试 {m['origin_load_count']} 次；{elapsed * 1000:.0f} ms 内全部返回；"
+              f"恢复后 source={after.get('source')}")
+
+        # (b)
+        kb = "demo:hot:4"
+        x = stable_hash(kb) % 3
+        reps = [x, (x + 1) % 3]
+        call("POST", gw + "/debug/reset", {})
+        for i in reps:
+            c.stop_node(i)
+        r.step(f"(b) 停掉 {kb} 的两个副本节点 {reps}")
+        rb = call("GET", gw + "/query?key=" + quote(kb, safe=""), timeout=5)
+        mb = call("GET", gw + "/debug/metrics")
+        r.step(f"(b) /query {kb}", rb)
+        for i in reps:
+            c.start_node(i)
+        r.step("(b) 两个节点重新启动")
+        b_ok = rb.get("error") == "NODES_UNAVAILABLE" and mb["origin_load_count"] == 0
+        r.see(f"(b) 返回 {rb.get('error')}，后端被查 {mb['origin_load_count']} 次")
+
+        # (c)
+        kc = "demo:hot:5"
+        x = stable_hash(kc) % 3
+        reps = [x, (x + 1) % 3]
+        call("POST", gw + "/debug/reset", {})
+        call("POST", gw + "/debug/origin", {"delay": 2.0})
+        r.step("(c) 把模拟后端调慢到 2 秒，方便在回源途中注入故障")
+        import threading
+        holder = {}
+        th = threading.Thread(target=lambda: holder.update(res=call("GET", gw + "/query?key=" + quote(kc, safe=""), timeout=10)))
+        th.start()
+        time.sleep(0.8)
+        for i in reps:
+            c.stop_node(i)
+        r.step(f"(c) /query {kc} 已经在回源，这时停掉它的两个副本节点 {reps}")
+        th.join()
+        rc = holder.get("res", {})
+        mc = call("GET", gw + "/debug/metrics")
+        r.step(f"(c) /query {kc} 的返回", rc)
+        call("POST", gw + "/debug/origin", {"delay": ORIGIN_DELAY})
+        c_ok = (rc.get("ok") and rc.get("found") and rc.get("source") == "origin"
+                and rc.get("cache_filled") is False and mc["refill_failed_count"] == 1)
+        r.see(f"(c) 客户端拿到 value={rc.get('value')}，cache_filled={rc.get('cache_filled')}，refill_failed_count={mc['refill_failed_count']}")
+
+    r.done(a_ok and b_ok and c_ok,
+           "(a) 后端挂了也只尝试一次，错误被同一个 key 的所有等待者共享，不会出现 50 个请求同时去敲一个已经挂掉的后端；"
+           "失败后状态被清理，后端一恢复就能正常回源。(b) 缓存节点连不上时，入口不知道缓存里到底有没有，"
+           "所以直接报 NODES_UNAVAILABLE，不当成未命中去回源，否则节点一抖动就会把后端打满。"
+           "(c) 后端已经查到了，数据照样返回给客户端，但如实告诉它“没写进缓存”，下一次还会回源。")
+    return r
+
+
 EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E3": e3, "E4": e4, "E5": e5, "E6": e6, "E7": e7, "E8": e8,
-               "E9": e9, "E10": e10}
+               "E9": e9, "E10": e10, "E11": e11}
 
 
 def main():

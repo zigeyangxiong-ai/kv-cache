@@ -21,6 +21,7 @@ class MockOrigin:
     def __init__(self, delay=0.15, fail_keys=()):
         self.delay = delay
         self.fail_keys = set(fail_keys)
+        self.down = False  # 实验用：模拟整个后端挂掉
         self.load_count = 0
         self._lock = threading.Lock()
         self.data = {f"demo:hot:{i}": f"demo-result-{i}" for i in range(1, 11)}
@@ -29,7 +30,7 @@ class MockOrigin:
         with self._lock:
             self.load_count += 1
         time.sleep(self.delay)
-        if key in self.fail_keys:
+        if self.down or key in self.fail_keys:
             raise OriginUnavailable(key)
         return self.data.get(key)  # None 表示后端也没有
 

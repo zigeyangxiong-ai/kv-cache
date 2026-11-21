@@ -7,6 +7,7 @@
   GET  /stats
   GET  /debug/metrics                         ->  回源次数、命中次数等计数（实验用）
   POST /debug/reset                           ->  计数清零（实验用）
+  POST /debug/origin  {"down", "delay"}       ->  让模拟后端故障或变慢（实验用）
 
 启动：python -m kvcache.gateway --port 8000 --nodes 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
 """
@@ -236,6 +237,13 @@ class Gateway:
         if method == "POST" and path == "/debug/reset":
             self.reset_metrics()
             return 200, {"ok": True}
+        if method == "POST" and path == "/debug/origin":
+            body = body or {}
+            if "down" in body:
+                self.origin.down = bool(body["down"])
+            if "delay" in body:
+                self.origin.delay = float(body["delay"])
+            return 200, {"ok": True, "down": self.origin.down, "delay_ms": int(self.origin.delay * 1000)}
         return 404, {"ok": False, "error": "NOT_FOUND"}
 
 
