@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+logs/
+gateway_state.json
+experiments/results/logs/
+experiments/results/_gateway_state.json

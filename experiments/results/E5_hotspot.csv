@@ -1,0 +1,3 @@
+mode,requests,node0,node1,node2,avg_ms,p95_ms
+uniform,3000,1046,1011,943,22.17,38.38
+hotspot,3000,1990,542,468,22.64,41.31
