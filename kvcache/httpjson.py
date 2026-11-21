@@ -51,10 +51,14 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._handle("PUT")
 
 
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # 默认的连接等待队列只有 5，100 个并发请求同时连进来会被直接拒绝（WinError 10061）
+    request_queue_size = 1024
+
+
 def serve(handler_cls, port):
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
-    server.daemon_threads = True
-    return server
+    return _Server(("127.0.0.1", port), handler_cls)
 
 
 def call(method, url, body=None, timeout=1.0):

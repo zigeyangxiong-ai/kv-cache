@@ -18,12 +18,15 @@ NODE_PORTS = [8001, 8002, 8003]
 
 class Cluster:
     def __init__(self, gateway_port=GATEWAY_PORT, node_ports=NODE_PORTS, capacity=1000,
-                 write_quorum=1, version_check=True, state_file=None, log_dir=None):
+                 write_quorum=1, version_check=True, state_file=None, log_dir=None,
+                 singleflight=True, origin_delay=0.15):
         self.gateway_port = gateway_port
         self.node_ports = list(node_ports)
         self.capacity = capacity
         self.write_quorum = write_quorum
         self.version_check = version_check
+        self.singleflight = singleflight
+        self.origin_delay = origin_delay
         self.state_file = state_file or os.path.join(ROOT, "gateway_state.json")
         self.log_dir = log_dir or os.path.join(ROOT, "logs")
         os.makedirs(self.log_dir, exist_ok=True)
@@ -38,10 +41,10 @@ class Cluster:
     def node_url(self, i):
         return f"http://127.0.0.1:{self.node_ports[i]}"
 
-    def _spawn(self, args, log_name):
+    def _spawn(self, args, log_name, extra_env=None):
         log = open(os.path.join(self.log_dir, log_name), "a", encoding="utf-8")
         self._logs.append(log)
-        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", **(extra_env or {}))
         return subprocess.Popen([sys.executable, "-m", *args], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
 
     def start_node(self, i):
@@ -67,8 +70,10 @@ class Cluster:
             self.start_node(i)
         nodes = ",".join(f"127.0.0.1:{p}" for p in self.node_ports)
         self.gateway = self._spawn(["kvcache.gateway", "--port", str(self.gateway_port), "--nodes", nodes,
-                                    "--write-quorum", str(self.write_quorum), "--state-file", self.state_file],
-                                   "gateway.log")
+                                    "--write-quorum", str(self.write_quorum), "--state-file", self.state_file,
+                                    "--origin-delay", str(self.origin_delay)],
+                                   "gateway.log",
+                                   {"ENABLE_SINGLEFLIGHT": "true" if self.singleflight else "false"})
         _wait_up(self.gateway_url + "/stats")
         return self
 

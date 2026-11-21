@@ -1,9 +1,12 @@
 """入口（路由）：客户端只和它打交道。
 
   POST /set   {"key", "value", "ttl_seconds"}  ->  {"ok", "version", "acks"}
-  GET  /get?key=                              ->  {"ok", "found", "value", "version", "from_node"}
+  GET  /get?key=                              ->  只查缓存：{"ok", "found", "value", "version", "from_node"}
+  GET  /query?key=                            ->  查缓存，没命中就回源并写回：{"ok", "found", "value", "source"}
   GET  /route?key=                            ->  这个 key 会落到哪两个节点
   GET  /stats
+  GET  /debug/metrics                         ->  回源次数、命中次数等计数（实验用）
+  POST /debug/reset                           ->  计数清零（实验用）
 
 启动：python -m kvcache.gateway --port 8000 --nodes 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
 """
@@ -17,8 +20,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from .httpjson import JsonHandler, call, serve
+from .stampede import MockOrigin, OriginUnavailable, SingleFlight
 
 TIMEOUT = 1.0
+REFILL_TTL = 3.0  # 回源拿到的数据写回缓存时用的 TTL
+ORIGIN_WAIT = 5.0  # 等待者最多等多久
 
 
 def stable_hash(key):
@@ -64,11 +70,27 @@ class VersionCounter:
 
 
 class Gateway:
-    def __init__(self, nodes, write_quorum=1, state_file=None):
+    def __init__(self, nodes, write_quorum=1, state_file=None, singleflight=True, origin_delay=0.15):
         self.nodes = nodes
         self.write_quorum = write_quorum
         self.versions = VersionCounter(state_file)
         self.pool = ThreadPoolExecutor(max_workers=32)
+        self.singleflight_on = singleflight
+        self.origin = MockOrigin(delay=origin_delay)
+        self.flight = SingleFlight()
+        self._m_lock = threading.Lock()
+        self.metrics = {}
+        self.reset_metrics()
+
+    def reset_metrics(self):
+        with self._m_lock:
+            self.metrics = {"query_count": 0, "cache_hit_count": 0, "cache_miss_count": 0,
+                            "coalesced_waiter_count": 0, "refill_failed_count": 0}
+        self.origin.load_count = 0
+
+    def _bump(self, name):
+        with self._m_lock:
+            self.metrics[name] += 1
 
     def replicas(self, key):
         x = stable_hash(key) % len(self.nodes)
@@ -132,6 +154,59 @@ class Gateway:
             return 503, {"ok": False, "error": "NODES_UNAVAILABLE", "unreachable": failed, "replicas": replicas}
         return 200, {"ok": True, "found": False, "replicas": replicas}
 
+    def _load_and_refill(self, key, recheck):
+        """回源并写回缓存。返回 (status, payload)。"""
+        if recheck:
+            # 拿到回源权以后再看一眼缓存：可能前一批请求刚好写回了
+            status, r = self.get(key)
+            if status == 200 and r.get("found"):
+                return 200, {"ok": True, "found": True, "value": r["value"], "source": "cache"}
+        try:
+            value = self.origin.load(key)
+        except OriginUnavailable:
+            return 503, {"ok": False, "error": "ORIGIN_UNAVAILABLE"}
+        if value is None:
+            # 后端也没有。这一版没做负缓存，每次查不存在的 key 都会回源一次
+            return 200, {"ok": True, "found": False, "source": "origin"}
+        status, w = self.set({"key": key, "value": value, "ttl_seconds": REFILL_TTL})
+        payload = {"ok": True, "found": True, "value": value, "source": "origin", "cache_filled": status == 200}
+        if status != 200:
+            self._bump("refill_failed_count")
+        return 200, payload
+
+    def query(self, key):
+        if not key:
+            return 400, {"ok": False, "error": "KEY_EMPTY"}
+        self._bump("query_count")
+        status, r = self.get(key)
+        if status == 200 and r.get("found"):
+            self._bump("cache_hit_count")
+            return 200, {"ok": True, "found": True, "value": r["value"], "source": "cache"}
+        if status != 200:
+            # 两个副本都连不上：不能当成普通的缓存未命中去回源
+            return status, r
+        self._bump("cache_miss_count")
+
+        if not self.singleflight_on:
+            return self._load_and_refill(key, recheck=False)
+        try:
+            (status, payload), shared = self.flight.do(
+                key, lambda: self._load_and_refill(key, recheck=True), timeout=ORIGIN_WAIT)
+        except TimeoutError:
+            return 504, {"ok": False, "error": "ORIGIN_TIMEOUT"}
+        if shared:
+            self._bump("coalesced_waiter_count")
+            payload = dict(payload, shared=True)
+        return status, payload
+
+    def debug_metrics(self):
+        with self._m_lock:
+            m = dict(self.metrics)
+        m["origin_load_count"] = self.origin.load_count
+        m["singleflight"] = self.singleflight_on
+        m["origin_delay_ms"] = int(self.origin.delay * 1000)
+        return 200, {"ok": True, **m}
+
     def stats(self):
         out = []
         for i, addr in enumerate(self.nodes):
@@ -152,8 +227,15 @@ class Gateway:
                 return 400, {"ok": False, "error": "KEY_EMPTY"}
             x, y = self.replicas(key)
             return 200, {"ok": True, "key": key, "hash_mod_3": x, "primary": x, "backup": y}
+        if method == "GET" and path == "/query":
+            return self.query(query.get("key", ""))
         if method == "GET" and path == "/stats":
             return self.stats()
+        if method == "GET" and path == "/debug/metrics":
+            return self.debug_metrics()
+        if method == "POST" and path == "/debug/reset":
+            self.reset_metrics()
+            return 200, {"ok": True}
         return 404, {"ok": False, "error": "NOT_FOUND"}
 
 
@@ -168,16 +250,21 @@ def main():
     ap.add_argument("--nodes", required=True, help="逗号分隔，例如 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003")
     ap.add_argument("--write-quorum", type=int, default=1)
     ap.add_argument("--state-file", default="gateway_state.json")
+    ap.add_argument("--origin-delay", type=float, default=0.15, help="模拟数据源每次查询耗时（秒）")
     args = ap.parse_args()
 
-    gw = Gateway(args.nodes.split(","), write_quorum=args.write_quorum, state_file=args.state_file)
+    # 对照实验用：ENABLE_SINGLEFLIGHT=false 时关闭请求合并
+    sf = os.environ.get("ENABLE_SINGLEFLIGHT", "true").lower() not in ("0", "false", "no", "off")
+    gw = Gateway(args.nodes.split(","), write_quorum=args.write_quorum, state_file=args.state_file,
+                 singleflight=sf, origin_delay=args.origin_delay)
 
     class Handler(JsonHandler):
         def route(self, method, path, query, body):
             return gw.route(method, path, query, body)
 
     server = serve(Handler, args.port)
-    print(f"[gateway] listening on 127.0.0.1:{args.port} nodes={args.nodes} W={args.write_quorum}", flush=True)
+    print(f"[gateway] listening on 127.0.0.1:{args.port} nodes={args.nodes} W={args.write_quorum} "
+          f"singleflight={'on' if sf else 'off'}", flush=True)
     server.serve_forever()
 
 

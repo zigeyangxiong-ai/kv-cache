@@ -1,14 +1,15 @@
 # 临时缓存 KV 存储（分布式系统课程项目 · 场景 8）
 
 一个能在一台电脑上跑起来的小型分布式缓存：1 个入口 + 3 个存储节点，每个都是独立进程。
-支持按 key 存取、TTL 过期、LRU 淘汰、每条数据两个副本、版本号防止旧消息覆盖新值。
+支持按 key 存取、TTL 过期、LRU 淘汰、每条数据两个副本、版本号防止旧消息覆盖新值，
+以及 **防缓存击穿**：热点 key 过期时，同一个 key 的并发请求只回源一次（Singleflight）。
 
 GitHub：https://github.com/zigeyangxiong-ai/kv-cache
 
 ## 运行环境
 
 - Python 3.9 及以上（我们用的是 3.11）
-- 不需要安装任何第三方库。只有实验 E5 画图用到 matplotlib，没装也能跑，只是不出图。
+- 不需要安装任何第三方库。只有实验 E5、E9 画图用到 matplotlib，没装也能跑，只是不出图。
 
 ## 怎么运行
 
@@ -31,17 +32,34 @@ python -m kvcache.cli stats
 
 `route` 会显示这个 key 落在哪两个节点；`stats` 显示每个节点存了多少条、淘汰和过期了多少。
 
-**3. 跑单元测试**（不用启动集群）
+**3. 演示防缓存击穿**
+
+```
+python -m kvcache.cli query demo:hot:1
+python -m kvcache.cli query demo:hot:1
+python -m kvcache.cli metrics
+```
+
+第一次 `query` 缓存里没有，会去模拟数据源查（`"source": "origin"`），并写回缓存，TTL 3 秒；
+3 秒内再查会直接命中（`"source": "cache"`）。`metrics` 能看到回源了几次。
+
+想看关闭防护的效果，用环境变量关掉 Singleflight 再启动入口（PowerShell）：
+
+```
+$env:ENABLE_SINGLEFLIGHT="false"; python -m kvcache.gateway --port 8000 --nodes 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003
+```
+
+**4. 跑单元测试**（不用启动集群）
 
 ```
 python -m unittest discover -s tests -v
 ```
 
-**4. 跑故障注入实验**（会自己启动和关闭集群，用 18000 段端口，不影响第 1 步）
+**5. 跑故障注入实验**（会自己启动和关闭集群，用 18000 段端口，不影响第 1 步）
 
 ```
-python experiments/run_experiments.py          # 全部，大约 1 分钟
-python experiments/run_experiments.py E1 E3    # 只跑指定的
+python experiments/run_experiments.py          # 全部，大约 2 分钟
+python experiments/run_experiments.py E9 E10   # 只跑指定的
 ```
 
 每个实验先打印预测，再注入故障，最后对照实际结果。记录保存在 `experiments/results/experiment_log.md`。
@@ -52,13 +70,28 @@ python experiments/run_experiments.py E1 E3    # 只跑指定的
 kvcache/
   store.py      单个节点内的存储：字典 + TTL + LRU + 版本比较（不涉及网络）
   node.py       存储节点，把 store 包装成 HTTP 接口
-  gateway.py    入口：决定 key 去哪两个节点、分配版本号、汇总结果
+  gateway.py    入口：决定 key 去哪两个节点、分配版本号、汇总结果；/query 回源
+  stampede.py   防击穿：模拟数据源 + Singleflight（不涉及网络）
   cluster.py    在本机启动/停止/重启各个进程
   cli.py        命令行客户端
   httpjson.py   HTTP + JSON 的小工具
 tests/          单元测试
 experiments/    故障注入实验和结果
 ```
+
+## 接口
+
+| 接口 | 作用 |
+|---|---|
+| `POST /set` | 写入，`{"key", "value", "ttl_seconds"}` |
+| `GET /get?key=` | **只查缓存**，没有就返回 `found: false` |
+| `GET /query?key=` | 查缓存，**没命中就回源并写回**，返回里带 `source`（`cache` 或 `origin`） |
+| `GET /route?key=` | 这个 key 落在哪两个节点 |
+| `GET /stats` | 各节点的条目数、淘汰数、过期数 |
+| `GET /debug/metrics` | 回源次数、命中次数、合并的等待者数（实验用） |
+| `POST /debug/reset` | 计数清零（实验用） |
+
+原来的 `/get` 没有改动，所以之前的实验和测试都不受影响。
 
 ## 设计要点
 
@@ -74,20 +107,33 @@ experiments/    故障注入实验和结果
 **版本号：** 节点只接受比本地更新的版本，相同或更旧的直接忽略。这样重复消息不会产生副作用，延迟到达的旧消息也不会盖掉新值。
 版本号由入口分配，不依赖各台机器的时钟。入口会把已分配到的位置记在 `gateway_state.json`，重启后接着往上分配。
 
-**TTL：** 每条记录带到期时间，读的时候发现过期就删掉（惰性删除）。
+**TTL：** 每条记录带到期时间，读的时候发现过期就删掉（惰性删除）。没有后台定时清理。
 
 **LRU：** 每个节点默认最多 1000 条，满了就删掉最久没被读写的那条。用 `OrderedDict` 实现。
+
+**防缓存击穿（Singleflight）：** 热点 key 一过期，很多请求会同时发现缓存没了，如果每个都去查后端，
+后端会在一瞬间收到大量一模一样的查询，这就是缓存击穿。`/query` 的做法是：
+
+1. 先查缓存，命中就直接返回。
+2. 没命中时，同一个 key 只让第一个请求去回源，其他请求等它的结果。
+3. 回源拿到数据后，用原来的 `/set` 流程写回两个副本（TTL 3 秒），再把结果交给所有等待者。
+4. 回源失败或超时，所有等待者都会收到同样的错误，不会一直挂着；不同 key 之间互不阻塞。
+
+模拟数据源写在入口进程里（`stampede.py` 的 `MockOrigin`），每次查询固定延迟 150 ms，只认 `demo:hot:1` 到 `demo:hot:10`
+这些预置 key。不把用户 `/set` 的数据当成后端数据，是为了避免缓存被淘汰后回源拿到和用户最后写入不一致的旧内容。
 
 ## 我们接受的限制
 
 这些是有意的取舍，实验里也验证过：
 
 - 写入只等 1 个确认，唯一存好的节点挂掉，数据就丢了（实验 E1b）。
-- 读取不比较两个副本，可能读到旧值。
+- 读取不比较两个副本，可能读到旧值。版本号能防止旧写覆盖新值，但**不会自动修复**没收到更新的副本，所以不能说做到了最终一致性。
 - 数据只在内存里，节点重启就清空，也不会自动从另一个副本补回来（实验 E4）。
 - 固定 3 个节点、取模分配，不支持加节点和数据迁移。
 - 热点 key 的读请求全部压在首选节点上（实验 E5）。
 - TTL 用的是物理时间，时钟倒退会让过期数据多活一会儿（实验 E8）。
+- Singleflight **只在同一个入口进程内有效**；如果部署多个入口，需要跨进程协调。
+- 防击穿不等于防雪崩（大量不同 key 同时过期）和防穿透（反复查本来就不存在的数据）。这一版没做负缓存，查不存在的 key 每次都会回源。
 - 没有实现 CAS 和磁盘持久化，所以课程列表里的"两个客户端同时 CAS""磁盘写成功但响应丢失"不在这一版的实验范围内。
 
 ## 实验一览
@@ -103,5 +149,9 @@ experiments/    故障注入实验和结果
 | E6 | TTL 到期 | 到期前能读，到期后读不到 |
 | E7 | LRU 淘汰 | 容量 3 时，最久没用的那条被删掉 |
 | E8 | 时钟倒退 60 秒 | 版本比较不受影响；过期数据"复活" |
+| E9 | 热点 key 过期后 100 个请求同时到达 | 关闭 Singleflight 每轮回源 82～100 次；开启后每轮只回源 1 次，两种情况 100 个请求都成功 |
+| E10 | 回填后 TTL 内再次访问 | 100 个请求全部命中缓存，不再回源；过期后再查才重新回源 |
 
-具体数字以 `experiments/results/experiment_log.md` 为准，每次运行会略有不同。
+E9 每种情况各跑 5 轮，每轮前都先让 key 过期。具体数字以 `experiments/results/experiment_log.md` 和 `E9_stampede.csv` 为准，每次运行会略有不同。
+
+关闭时回源次数不是每次正好 100：同时起跑的 100 个线程里，跑得慢的那些到达时，前面的请求可能已经把数据写回缓存了，于是直接命中。

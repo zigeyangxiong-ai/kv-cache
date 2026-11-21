@@ -371,7 +371,181 @@ def e8():
     return r
 
 
-EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E3": e3, "E4": e4, "E5": e5, "E6": e6, "E7": e7, "E8": e8}
+# ---------------------------------------------------------------- E9
+N_CONC, ROUNDS, ORIGIN_DELAY = 100, 5, 0.15
+
+
+def _stampede_round(c, key):
+    """等 key 过期后，100 个线程同时 /query，返回 (回源次数, 成功数, 延迟列表, 耗时)。"""
+    import threading
+    call("POST", c.gateway_url + "/debug/reset", {})
+    barrier = threading.Barrier(N_CONC)
+    lat, oks = [], []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait()
+        t0 = time.perf_counter()
+        try:
+            r = call("GET", c.gateway_url + "/query?key=" + quote(key, safe=""), timeout=15)
+            ok = r.get("ok") and r.get("found")
+        except OSError:
+            ok = False
+        with lock:
+            lat.append((time.perf_counter() - t0) * 1000)
+            oks.append(bool(ok))
+
+    ts = [threading.Thread(target=worker) for _ in range(N_CONC)]
+    t_start = time.perf_counter()
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    elapsed = time.perf_counter() - t_start
+    m = call("GET", c.gateway_url + "/debug/metrics")
+    return m["origin_load_count"], sum(oks), sorted(lat), elapsed, m
+
+
+def e9():
+    r = Record("E9", "热点 key 过期后 100 个请求同时到达（缓存击穿）",
+               "同一个 key 的并发未命中只回源一次（Singleflight，只在同一个入口进程内有效）")
+    r.predict(f"热点 key demo:hot:1 刚过期时，{N_CONC} 个请求同时 /query。关闭 Singleflight：每个请求都各自回源，"
+              f"回源次数接近 {N_CONC}；开启后：只有 1 个请求回源，其余等它的结果，回源次数约为 1。两种情况请求都应全部成功。")
+    key = "demo:hot:1"
+    rows = []
+    for sf in (False, True):
+        mode = "开启 Singleflight" if sf else "关闭 Singleflight"
+        with new_cluster(singleflight=sf, origin_delay=ORIGIN_DELAY) as c:
+            for rnd in range(1, ROUNDS + 1):
+                # 先让缓存里有这个 key，再等它过期，确保这一轮开始时确实是“刚过期”
+                call("GET", c.gateway_url + "/query?key=" + quote(key, safe=""), timeout=5)
+                time.sleep(3.3)
+                loads, okn, lat, elapsed, m = _stampede_round(c, key)
+                row = {"singleflight": "on" if sf else "off", "round": rnd, "concurrency": N_CONC,
+                       "origin_loads": loads, "success": okn, "waiters": m["coalesced_waiter_count"],
+                       "avg_ms": round(sum(lat) / len(lat), 1), "p95_ms": round(lat[int(len(lat) * 0.95) - 1], 1),
+                       "throughput_rps": round(N_CONC / elapsed, 1)}
+                rows.append(row)
+                r.step(f"[{mode}] 第 {rnd} 轮：回源 {loads} 次，成功 {okn}/{N_CONC}，等待者 {row['waiters']}，"
+                       f"平均 {row['avg_ms']} ms，P95 {row['p95_ms']} ms")
+    with open(os.path.join(RESULTS, "E9_stampede.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+
+    def summary(flag):
+        sel = [x for x in rows if x["singleflight"] == flag]
+        loads = [x["origin_loads"] for x in sel]
+        return {"loads": loads, "avg_loads": sum(loads) / len(loads),
+                "success": sum(x["success"] for x in sel), "total": len(sel) * N_CONC,
+                "avg_ms": sum(x["avg_ms"] for x in sel) / len(sel),
+                "p95_ms": sum(x["p95_ms"] for x in sel) / len(sel)}
+
+    off, on = summary("off"), summary("on")
+    _plot_e9(off, on)
+    r.see(f"关闭：每轮回源 {off['loads']}，平均 {off['avg_loads']:.1f} 次；成功 {off['success']}/{off['total']}；"
+          f"平均延迟 {off['avg_ms']:.0f} ms，P95 {off['p95_ms']:.0f} ms")
+    r.see(f"开启：每轮回源 {on['loads']}，平均 {on['avg_loads']:.1f} 次；成功 {on['success']}/{on['total']}；"
+          f"平均延迟 {on['avg_ms']:.0f} ms，P95 {on['p95_ms']:.0f} ms")
+    ok = (on["success"] == on["total"] and off["success"] == off["total"]
+          and max(on["loads"]) <= 2 and off["avg_loads"] >= N_CONC * 0.5)
+    r.done(ok, "关闭时，大家同时发现缓存没了，于是各自去查后端，后端在一瞬间收到几十上百次一样的查询，这就是缓存击穿。"
+               "开启后，第一个请求负责回源，其他请求等它的结果，后端只被查了一次。"
+               "注意：这只在同一个入口进程内有效；如果以后部署多个入口，需要跨进程的锁。"
+               "开启 Singleflight 也不能解决缓存雪崩（大量不同 key 同时过期）和缓存穿透（查本来就不存在的数据）。")
+    return r
+
+
+def _plot_e9(off, on):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+    fig, ax = plt.subplots(figsize=(7, 4), dpi=150)
+    rounds = list(range(1, len(off["loads"]) + 1))
+    w = 0.36
+    b1 = ax.bar([x - w / 2 for x in rounds], off["loads"], w, label="关闭 Singleflight", color="#8FC9E8")
+    b2 = ax.bar([x + w / 2 for x in rounds], on["loads"], w, label="开启 Singleflight", color="#2683C6")
+    for bars in (b1, b2):
+        for b in bars:
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 1.5, str(int(b.get_height())),
+                    ha="center", va="bottom", fontsize=9, color="#333333")
+    ax.set_xticks(rounds)
+    ax.set_xticklabels([f"第 {x} 轮" for x in rounds])
+    ax.set_ylabel("后端（模拟数据源）被查询的次数")
+    ax.set_title(f"热点 key 刚过期，{N_CONC} 个请求同时到达")
+    ax.set_ylim(0, N_CONC * 1.3)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", color="#E5E5E5")
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False, loc="upper center", ncol=2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(RESULTS, "E9_stampede.png"))
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------- E10
+def e10():
+    r = Record("E10", "回填后在 TTL 内再次访问（缓存命中）", "回源拿到的数据会写回缓存，TTL 内的后续请求直接命中，不再回源")
+    r.predict("第一次 /query 未命中，回源 1 次并写回（TTL 3 秒）。紧接着 100 个并发 /query 全部命中缓存，回源次数仍是 1。"
+              "等 3 秒过期后再查一次，会重新回源，回源次数变成 2。")
+    key = "demo:hot:2"
+    with new_cluster(singleflight=True, origin_delay=ORIGIN_DELAY) as c:
+        call("POST", c.gateway_url + "/debug/reset", {})
+        first = call("GET", c.gateway_url + "/query?key=" + quote(key, safe=""), timeout=5)
+        r.step(f"第一次 /query {key}", first)
+        loads, okn, lat, elapsed, m = _stampede_round_keep(c, key)
+        r.step(f"紧接着 {N_CONC} 个并发 /query：成功 {okn}，命中缓存 {m['cache_hit_count']} 次，累计回源 {m['origin_load_count']} 次")
+        time.sleep(3.3)
+        again = call("GET", c.gateway_url + "/query?key=" + quote(key, safe=""), timeout=5)
+        m2 = call("GET", c.gateway_url + "/debug/metrics")
+        r.step("3.3 秒后（已过期）再查一次", again)
+        r.see(f"第一次来源：{first.get('source')}，cache_filled={first.get('cache_filled')}")
+        r.see(f"TTL 内 {N_CONC} 个请求：命中 {m['cache_hit_count']} 次，回源总数仍为 {m['origin_load_count']}")
+        r.see(f"过期后再查：来源 {again.get('source')}，回源总数变为 {m2['origin_load_count']}")
+        ok = (first.get("source") == "origin" and first.get("cache_filled") and okn == N_CONC
+              and m["cache_hit_count"] == N_CONC and m["origin_load_count"] == 1
+              and again.get("source") == "origin" and m2["origin_load_count"] == 2)
+        r.done(ok, "回源后会用原来的 /set 流程写回两个副本，所以 TTL 内的请求都从缓存拿。"
+                   "回填的 TTL 是 3 秒，过期后第一个请求会重新回源，这正是 E9 里要防的那个时刻。")
+    return r
+
+
+def _stampede_round_keep(c, key):
+    """和 _stampede_round 一样并发查询，但不清零计数器。"""
+    import threading
+    barrier = threading.Barrier(N_CONC)
+    lat, oks = [], []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait()
+        t0 = time.perf_counter()
+        try:
+            res = call("GET", c.gateway_url + "/query?key=" + quote(key, safe=""), timeout=15)
+            ok = res.get("ok") and res.get("found")
+        except OSError:
+            ok = False
+        with lock:
+            lat.append((time.perf_counter() - t0) * 1000)
+            oks.append(bool(ok))
+
+    ts = [threading.Thread(target=worker) for _ in range(N_CONC)]
+    t0 = time.perf_counter()
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    m = call("GET", c.gateway_url + "/debug/metrics")
+    return m["origin_load_count"], sum(oks), sorted(lat), time.perf_counter() - t0, m
+
+
+EXPERIMENTS = {"E1": e1, "E1b": e1b, "E2": e2, "E3": e3, "E4": e4, "E5": e5, "E6": e6, "E7": e7, "E8": e8,
+               "E9": e9, "E10": e10}
 
 
 def main():
